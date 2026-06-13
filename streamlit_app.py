@@ -3,26 +3,44 @@ import requests
 import pandas as pd
 import time
 import math
+import io
 
 st.set_page_config(page_title="EVE Online Торговый Аналитик", layout="wide")
 st.title("📊 Анализатор межрегионального арбитража Jita ➡️ Amarr")
 
 # --- ЗАГРУЗКА И КЭШИРОВАНИЕ ГЛОБАЛЬНОЙ БАЗЫ EVE ONLINE ---
-# Функция кэшируется на 24 часа, чтобы не скачивать файлы при каждом клике
 @st.cache_data(ttl=86400, show_spinner="Загрузка глобальной базы рынка EVE Online...")
 def load_eve_market_data():
+    # Маскируемся под обычный браузер, чтобы защита Fuzzwork (Cloudflare) не блокировала облако Streamlit
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+    }
+    
+    def fetch_csv(base_name):
+        # Fuzzwork периодически меняет формат выгрузки, поэтому скрипт попробует все 3 варианта автоматически
+        for ext in ['.csv', '.csv.gz', '.csv.bz2']:
+            url = f"https://www.fuzzwork.co.uk/dump/latest/{base_name}{ext}"
+            try:
+                resp = requests.get(url, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    compression = 'infer'
+                    if ext == '.csv.gz': compression = 'gzip'
+                    if ext == '.csv.bz2': compression = 'bz2'
+                    
+                    if ext == '.csv':
+                        return pd.read_csv(io.StringIO(resp.text))
+                    else:
+                        return pd.read_csv(io.BytesIO(resp.content), compression=compression)
+            except:
+                continue
+        raise Exception(f"Файл {base_name} недоступен на сервере.")
+
     try:
-        # Скачиваем официальные дампы рынка (в сжатом виде .bz2)
-        groups_url = "https://www.fuzzwork.co.uk/dump/latest/invMarketGroups.csv.bz2"
-        types_url = "https://www.fuzzwork.co.uk/dump/latest/invTypes.csv.bz2"
-        
-        groups_df = pd.read_csv(groups_url)
-        types_df = pd.read_csv(types_url)
+        groups_df = fetch_csv('invMarketGroups')
+        types_df = fetch_csv('invTypes')
         
         # Оставляем только те предметы, которые реально продаются на рынке
         types_df = types_df[(types_df['published'] == 1) & (types_df['marketGroupID'].notna())]
-        
-        # Строим иерархию (Категория -> Подкатегория -> Предмет)
         group_dict = groups_df.set_index('marketGroupID').to_dict('index')
         
         def get_full_group_name(group_id):
@@ -32,11 +50,10 @@ def load_eve_market_data():
                 path.append(str(group_dict[current_id].get('marketGroupName', '')))
                 current_id = group_dict[current_id].get('parentGroupID')
                 if pd.isna(current_id): break
-            return " ➡️ ".join(path[::-1]) # Переворачиваем, чтобы было "Главная -> Подчиненная"
+            return " ➡️ ".join(path[::-1])
             
         groups_df['fullPath'] = groups_df['marketGroupID'].apply(get_full_group_name)
         
-        # Объединяем предметы с их категориями
         market_items = types_df[['typeID', 'typeName', 'marketGroupID']].merge(
             groups_df[['marketGroupID', 'fullPath']], on='marketGroupID'
         )
@@ -54,7 +71,6 @@ st.sidebar.header("🗂️ Выбор товаров для анализа")
 items_to_scan = {}
 
 if not global_market_df.empty:
-    # 1. Выбор по рыночным категориям
     all_categories = sorted(global_market_df['fullPath'].unique())
     selected_categories = st.sidebar.multiselect(
         "1. Выберите категории рынка (можно начать печатать):", 
@@ -62,7 +78,6 @@ if not global_market_df.empty:
         help="Например: Ship Equipment ➡️ Shield ➡️ Shield Extenders"
     )
     
-    # 2. Ручное добавление конкретных предметов (для удобства)
     manual_items_str = st.sidebar.text_input(
         "2. ИЛИ впишите конкретные товары (через запятую):",
         placeholder="Например: Tengu, PLEX, Mordu NET Resonator"
@@ -74,22 +89,18 @@ if not global_market_df.empty:
     min_roi = st.sidebar.number_input("Минимальная рентабельность (ROI), %", min_value=0.0, max_value=1000.0, value=15.0, step=1.0)
     min_volume = st.sidebar.number_input("Мин. продаж в день (Амарр)", min_value=0, max_value=10000, value=5, step=1)
     
-    # Собираем список TypeID на основе выбранных категорий
     if selected_categories:
         filtered_by_cat = global_market_df[global_market_df['fullPath'].isin(selected_categories)]
         for _, row in filtered_by_cat.iterrows():
             items_to_scan[row['typeName']] = row['typeID']
             
-    # Добавляем вручную вписанные товары
     if manual_items_str:
         manual_names = [name.strip().lower() for name in manual_items_str.split(',') if name.strip()]
-        # Ищем совпадения в базе
         found_manual = global_market_df[global_market_df['typeName'].str.lower().isin(manual_names)]
         for _, row in found_manual.iterrows():
             items_to_scan[row['typeName']] = row['typeID']
 
 # --- ЛОГИКА РАБОТЫ С ESI API ---
-
 def fetch_esi_data(url):
     try:
         response = requests.get(url, timeout=10)
@@ -101,8 +112,7 @@ def scan_market(items_dict):
     results = []
     total_items = len(items_dict)
     
-    # Информационная панель и прогресс-бар
-    est_time = math.ceil((total_items * 0.15) / 60) # Примерно 0.15 сек на предмет
+    est_time = math.ceil((total_items * 0.15) / 60)
     info_text = st.empty()
     info_text.info(f"В очереди {total_items} предметов. Примерное время сканирования: ~{est_time} мин.")
     progress_bar = st.progress(0)
@@ -145,7 +155,7 @@ def scan_market(items_dict):
                 "Прод. в Амарре (шт/день)": round(daily_vol_avg, 1)
             })
             
-        time.sleep(0.05) # Пауза против блокировки от ESI
+        time.sleep(0.05)
         
     info_text.empty()
     status_text.empty()
@@ -153,12 +163,10 @@ def scan_market(items_dict):
     return pd.DataFrame(results)
 
 # --- ГЛАВНАЯ КНОПКА ЗАПУСКА ---
-
 if st.button("🚀 Запустить сканирование рынка"):
     if not items_to_scan:
         st.warning("⚠️ Пожалуйста, выберите хотя бы одну категорию или впишите предмет вручную!")
     else:
-        # Защита от слишком большого запроса
         if len(items_to_scan) > 2000:
             st.error(f"Вы выбрали {len(items_to_scan)} предметов. ESI может заблокировать нас. Пожалуйста, сузьте поиск до 1500 предметов за один раз.")
         else:
