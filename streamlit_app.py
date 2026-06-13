@@ -19,7 +19,7 @@ def load_eve_market_data():
     def fetch_csv(base_name):
         # Fuzzwork периодически меняет формат выгрузки, поэтому скрипт попробует все 3 варианта автоматически
         for ext in ['.csv', '.csv.gz', '.csv.bz2']:
-            url = f"https://www.fuzzwork.co.uk/dump/latest/{base_name}{ext}"
+            url = f"https://www.fuzzwork.co.uk/dump/latest/csv/{base_name}{ext}"
             try:
                 resp = requests.get(url, headers=headers, timeout=15)
                 if resp.status_code == 200:
