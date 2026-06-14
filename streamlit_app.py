@@ -3,44 +3,22 @@ import requests
 import pandas as pd
 import time
 import math
-import io
 
 st.set_page_config(page_title="EVE Online Торговый Аналитик", layout="wide")
 st.title("📊 Анализатор межрегионального арбитража Jita ➡️ Amarr")
 
-# --- ЗАГРУЗКА И КЭШИРОВАНИЕ ГЛОБАЛЬНОЙ БАЗЫ EVE ONLINE ---
-@st.cache_data(ttl=86400, show_spinner="Загрузка глобальной базы рынка EVE Online...")
+# --- ЗАГРУЗКА ЛОКАЛЬНОЙ БАЗЫ EVE ONLINE ---
+@st.cache_data(show_spinner="Сборка дерева рынка из локальных файлов...")
 def load_eve_market_data():
-    # Маскируемся под обычный браузер, чтобы защита Fuzzwork (Cloudflare) не блокировала облако Streamlit
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-    }
-    
-    def fetch_csv(base_name):
-        # Fuzzwork периодически меняет формат выгрузки, поэтому скрипт попробует все 3 варианта автоматически
-        for ext in ['.csv', '.csv.gz', '.csv.bz2']:
-            url = f"https://www.fuzzwork.co.uk/dump/latest/csv/{base_name}{ext}"
-            try:
-                resp = requests.get(url, headers=headers, timeout=15)
-                if resp.status_code == 200:
-                    compression = 'infer'
-                    if ext == '.csv.gz': compression = 'gzip'
-                    if ext == '.csv.bz2': compression = 'bz2'
-                    
-                    if ext == '.csv':
-                        return pd.read_csv(io.StringIO(resp.text))
-                    else:
-                        return pd.read_csv(io.BytesIO(resp.content), compression=compression)
-            except:
-                continue
-        raise Exception(f"Файл {base_name} недоступен на сервере.")
-
     try:
-        groups_df = fetch_csv('invMarketGroups')
-        types_df = fetch_csv('invTypes')
+        # Теперь мы читаем файлы прямо из вашей папки на GitHub!
+        groups_df = pd.read_csv('invMarketGroups.csv')
+        types_df = pd.read_csv('invTypes.csv')
         
         # Оставляем только те предметы, которые реально продаются на рынке
         types_df = types_df[(types_df['published'] == 1) & (types_df['marketGroupID'].notna())]
+        
+        # Строим иерархию (Категория -> Подкатегория -> Предмет)
         group_dict = groups_df.set_index('marketGroupID').to_dict('index')
         
         def get_full_group_name(group_id):
@@ -54,12 +32,16 @@ def load_eve_market_data():
             
         groups_df['fullPath'] = groups_df['marketGroupID'].apply(get_full_group_name)
         
+        # Объединяем предметы с их категориями
         market_items = types_df[['typeID', 'typeName', 'marketGroupID']].merge(
             groups_df[['marketGroupID', 'fullPath']], on='marketGroupID'
         )
         return market_items
+    except FileNotFoundError:
+        st.error("Файлы базы данных не найдены! Убедитесь, что вы загрузили invMarketGroups.csv и invTypes.csv на GitHub в ту же папку.")
+        return pd.DataFrame()
     except Exception as e:
-        st.error(f"Ошибка загрузки базы данных: {e}")
+        st.error(f"Ошибка чтения базы данных: {e}")
         return pd.DataFrame()
 
 # Загружаем базу
