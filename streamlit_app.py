@@ -3,12 +3,13 @@ import requests
 import pandas as pd
 import time
 import math
+from streamlit_tree_select import tree_select
 
 st.set_page_config(page_title="EVE Online Торговый Аналитик", layout="wide")
 st.title("📊 Анализатор межрегионального арбитража Jita ➡️ Amarr")
 
 # --- ЗАГРУЗКА ЛОКАЛЬНОЙ БАЗЫ EVE ONLINE ---
-@st.cache_data(show_spinner="Сборка дерева рынка из локальных файлов...")
+@st.cache_data(show_spinner="Сборка интерактивного дерева рынка...")
 def load_eve_market_data():
     try:
         groups_df = pd.read_csv('invMarketGroups.csv')
@@ -19,61 +20,85 @@ def load_eve_market_data():
         
         group_dict = groups_df.set_index('marketGroupID').to_dict('index')
         
-        # Рекурсивная функция для построения полного пути категории
-        def get_full_group_name(group_id):
+        # Функция для получения списка всех родительских групп (включая саму группу) для каждого товара
+        def get_all_parent_groups(group_id):
             path = []
             current_id = group_id
             while pd.notna(current_id) and current_id in group_dict:
-                path.append(str(group_dict[current_id].get('marketGroupName', '')))
+                path.append(int(current_id))
                 current_id = group_dict[current_id].get('parentGroupID')
                 if pd.isna(current_id): break
-            return " ➡️ ".join(path[::-1])
+            return path
             
-        groups_df['fullPath'] = groups_df['marketGroupID'].apply(get_full_group_name)
+        # Для каждого товара сохраняем массив всех его родительских групп вверх по иерархии
+        types_df['all_groups'] = types_df['marketGroupID'].apply(get_all_parent_groups)
         
-        # Выделяем корневую категорию для удобного каскадного фильтра
-        groups_df['rootCategory'] = groups_df['fullPath'].apply(lambda x: x.split(" ➡️ ")[0] if isinstance(x, str) else "")
+        # Собираем только те ID групп, в которых физически есть опубликованные товары
+        published_group_ids = set()
+        for groups_list in types_df['all_groups']:
+            published_group_ids.update(groups_list)
+            
+        # Строим карту "Родитель -> Список детей" для построения дерева
+        from collections import defaultdict
+        children_map = defaultdict(list)
+        roots = []
         
-        market_items = types_df[['typeID', 'typeName', 'marketGroupID']].merge(
-            groups_df[['marketGroupID', 'fullPath', 'rootCategory']], on='marketGroupID'
-        )
-        return market_items
+        for g_id in published_group_ids:
+            parent = group_dict[g_id].get('parentGroupID')
+            if pd.isna(parent) or parent not in published_group_ids:
+                roots.append(g_id)
+            else:
+                children_map[int(parent)].append(g_id)
+                
+        # Рекурсивная функция сборки структуры дерева для компонента tree-select
+        def make_node(g_id):
+            name = group_dict[g_id].get('marketGroupName', f"Группа {g_id}")
+            node = {
+                "label": name,
+                "value": str(int(g_id)) # Значение должно быть строкой для корректной работы JS-компонента
+            }
+            children_ids = children_map.get(g_id, [])
+            if children_ids:
+                # Сортируем подкатегории по алфавиту
+                children_ids.sort(key=lambda x: group_dict[x].get('marketGroupName', ''))
+                node["children"] = [make_node(c_id) for c_id in children_ids]
+            return node
+            
+        roots.sort(key=lambda x: group_dict[x].get('marketGroupName', ''))
+        tree_nodes = [make_node(r_id) for r_id in roots]
+        
+        return types_df[['typeID', 'typeName', 'marketGroupID', 'all_groups']], tree_nodes
     except FileNotFoundError:
         st.error("Файлы базы данных не найдены! Убедитесь, что invMarketGroups.csv и invTypes.csv лежат на GitHub в той же папке.")
-        return pd.DataFrame()
+        return pd.DataFrame(), []
     except Exception as e:
         st.error(f"Ошибка чтения базы данных: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), []
 
-# Загружаем базу данных рынка
-global_market_df = load_eve_market_data()
+# Загружаем данные базы данных
+global_market_df, market_tree_nodes = load_eve_market_data()
 
 # --- ИНТЕРФЕЙС БОКОВОЙ ПАНЕЛИ ---
-st.sidebar.header("🗂️ Выбор товаров для анализа")
+st.sidebar.header("🗂️ Дерево рынка EVE Online")
 
 items_to_scan = {}
 
-if not global_market_df.empty:
-    # 1. Выбор корневой группы (Дерево рынка)
-    root_categories = ["Все категории"] + sorted(global_market_df['rootCategory'].unique().tolist())
-    selected_root = st.sidebar.selectbox("1. Основная группа рынка:", root_categories)
+if market_tree_nodes:
+    st.sidebar.markdown("Отметьте нужные категории рынка:")
     
-    # Фильтруем доступные пути в зависимости от выбранной корневой группы
-    if selected_root == "Все категории":
-        available_paths = sorted(global_market_df['fullPath'].unique())
-    else:
-        available_paths = sorted(global_market_df[global_market_df['rootCategory'] == selected_root]['fullPath'].unique())
-    
-    # 2. Выбор конкретных подкатегорий
-    selected_categories = st.sidebar.multiselect(
-        "2. Конкретные подкатегории:", 
-        available_paths,
-        help="Выберите одну или несколько папок рынка для сканирования"
+    # Визуальное дерево с галочками
+    return_select = tree_select(
+        market_tree_nodes, 
+        check_model="all", # Автоматически выбирает поддеревья при клике на родительский узел
+        only_leaf_checkmaps=False, 
+        direction="ltr"
     )
     
-    # 3. Ручной ввод отдельных позиций
+    selected_group_ids = return_select.get("checked", [])
+    
+    # Оставляем ручной ввод как альтернативу
     manual_items_str = st.sidebar.text_input(
-        "3. ИЛИ впишите конкретные товары (через запятую):",
+        "ИЛИ впишите конкретные товары (через запятую):",
         placeholder="Например: Tengu, PLEX"
     )
 
@@ -82,33 +107,36 @@ if not global_market_df.empty:
 
     min_roi = st.sidebar.number_input("Минимальная рентабельность (ROI), %", min_value=0.0, max_value=1000.0, value=15.0, step=1.0)
     min_volume = st.sidebar.number_input("Мин. продаж в день (Амарр, шт)", min_value=0, max_value=10000, value=5, step=1)
-    
-    # Новый фильтр по объёму ISK в день
     min_volume_isk = st.sidebar.number_input(
         "Мин. оборот в Амарре (ISK/день)", 
         min_value=0, 
         value=50000000, 
         step=10000000,
-        help="Отсекает товары, у которых дневной оборот (кол-во * цену) ниже указанного"
+        help="Отсекает товары, у которых суммарный дневной оборот (кол-во * цену) ниже этого значения"
     )
     
-    # Сбор ID предметов на основе выбранных фильтров ДО нажатия кнопки
-    if selected_categories:
-        filtered_by_cat = global_market_df[global_market_df['fullPath'].isin(selected_categories)]
-        for _, row in filtered_by_cat.iterrows():
-            items_to_scan[row['typeName']] = row['typeID']
-            
+    # Превращаем выбранные ID групп в множество для мгновенного поиска O(1)
+    selected_group_set = set(int(x) for x in selected_group_ids)
+    
+    # Маппинг: ищем какие товары входят в выбранные галочками папки (или их подпапки)
+    if selected_group_set:
+        for _, row in global_market_df.iterrows():
+            # Если ID текущей группы товара или любой из его родительских групп есть в выбранном сете
+            if any(g_id in selected_group_set for g_id in row['all_groups']):
+                items_to_scan[row['typeName']] = row['typeID']
+                
+    # Обрабатываем ручной ввод позиций
     if manual_items_str:
         manual_names = [name.strip().lower() for name in manual_items_str.split(',') if name.strip()]
         found_manual = global_market_df[global_market_df['typeName'].str.lower().isin(manual_names)]
         for _, row in found_manual.iterrows():
             items_to_scan[row['typeName']] = row['typeID']
 
-    # --- ДИНАМИЧЕСКИЙ СЧЕТЧИК ОЧЕРЕДИ ДО ЗАПУСКА ---
+    # --- ДИНАМИЧЕСКИЙ СЧЕТЧИК ОЧЕРЕДИ (РАБОТАЕТ ДО НАЖАТИЯ КНОПКИ) ---
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📊 Параметры текущей очереди")
     num_items = len(items_to_scan)
-    est_time_min = math.ceil((num_items * 0.18) / 60) # ~0.18 сек на один цикл запросов к ESI
+    est_time_min = math.ceil((num_items * 0.18) / 60) # Усредненный расчет времени на один поток запросов к ESI
     
     col_num, col_time = st.sidebar.columns(2)
     col_num.metric("Товаров к скану", f"{num_items} шт.")
@@ -155,7 +183,7 @@ def scan_market(items_dict):
         if jita_buy > 0 and amarr_sell > 0:
             gross_profit = amarr_sell - jita_buy
             roi = (gross_profit / jita_buy) * 100
-            daily_turnover_isk = daily_vol_avg * amarr_sell # Расчет денежного объема
+            daily_turnover_isk = daily_vol_avg * amarr_sell # Считаем денежный оборот
             
             results.append({
                 "Товар": item_name,
@@ -177,16 +205,16 @@ def scan_market(items_dict):
 # --- ГЛАВНАЯ КНОПКА ЗАПУСКА ---
 if st.button("🚀 Запустить сканирование рынка"):
     if not items_to_scan:
-        st.warning("⚠️ Пожалуйста, выберите хотя бы одну категорию или впишите предмет вручную!")
+        st.warning("⚠️ Пожалуйста, выберите хотя бы одну категорию в дереве рынка или введите название вручную!")
     else:
         if len(items_to_scan) > 2500:
-            st.error(f"Вы выбрали {len(items_to_scan)} предметов. ESI API может временно ограничить запросы. Пожалуйста, сузьте выборку до 2500 позиций.")
+            st.error(f"Вы выбрали {len(items_to_scan)} предметов. На серверах ESI стоят лимиты на частоту запросов. Пожалуйста, сузьте выборку до 2500 позиций (снимите галочки с избыточных категорий).")
         else:
             with st.spinner("Сбор актуальных стаканов из ESI API..."):
                 df = scan_market(items_to_scan)
                 
                 if not df.empty:
-                    # Применяем все фильтры, включая новый фильтр по обороту ISK
+                    # Применение комплексных фильтров
                     filtered_df = df[
                         (df["Рентабельность (%)"] >= min_roi) & 
                         (df["Прод. в Амарре (шт/день)"] >= min_volume) &
@@ -195,9 +223,9 @@ if st.button("🚀 Запустить сканирование рынка"):
                     filtered_df = filtered_df.sort_values(by="Рентабельность (%)", ascending=False)
                     
                     if not filtered_df.empty:
-                        st.success(f"Анализ завершен! Найдено {len(filtered_df)} выгодных позиций из {len(items_to_scan)} проверенных.")
+                        st.success(f"Анализ завершен! Найдено {len(filtered_df)} прибыльных позиций из {len(items_to_scan)} отсканированных.")
                         
-                        # Отображение таблицы с красивым разделением разрядов чисел (1,000,000)
+                        # Отображение таблицы с идеальным форматированием разрядов чисел
                         st.dataframe(
                             filtered_df, 
                             use_container_width=True,
@@ -219,6 +247,6 @@ if st.button("🚀 Запустить сканирование рынка"):
                             mime="text/csv",
                         )
                     else:
-                        st.warning("Ни один товар не подошел под выбранные критерии. Попробуйте снизить планку ROI или требуемого оборота в ISK.")
+                        st.warning("Ни один товар не прошел через ваши фильтры. Попробуйте снизить планку по ROI или требуемому объему торгов.")
                 else:
-                    st.error("Не удалось получить данные о ценах. Проверьте соединение с ESI API.")
+                    st.error("Не удалось получить рыночные данные. Попробуйте повторить попытку позже.")
