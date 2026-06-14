@@ -50,21 +50,21 @@ def load_eve_market_data():
             else:
                 children_map[int(parent)].append(g_id)
                 
-        # Рекурсивная функция сборки структуры дерева для компонента tree-select
+        # Рекурсивная функция сборки структуры дерева
         def make_node(g_id):
             name = group_dict[g_id].get('marketGroupName', f"Группа {g_id}")
             node = {
-                "label": name,
-                "value": str(int(g_id)) # Значение должно быть строкой для корректной работы JS-компонента
+                "label": str(name),
+                "value": str(int(g_id)) 
             }
             children_ids = children_map.get(g_id, [])
             if children_ids:
-                # Сортируем подкатегории по алфавиту
-                children_ids.sort(key=lambda x: group_dict[x].get('marketGroupName', ''))
+                # Сортируем подкатегории по алфавиту (защита от пустых имен)
+                children_ids.sort(key=lambda x: str(group_dict[x].get('marketGroupName', '')))
                 node["children"] = [make_node(c_id) for c_id in children_ids]
             return node
             
-        roots.sort(key=lambda x: group_dict[x].get('marketGroupName', ''))
+        roots.sort(key=lambda x: str(group_dict[x].get('marketGroupName', '')))
         tree_nodes = [make_node(r_id) for r_id in roots]
         
         return types_df[['typeID', 'typeName', 'marketGroupID', 'all_groups']], tree_nodes
@@ -86,15 +86,11 @@ items_to_scan = {}
 if market_tree_nodes:
     st.sidebar.markdown("Отметьте нужные категории рынка:")
     
-    # Визуальное дерево с галочками
-    return_select = tree_select(
-        market_tree_nodes, 
-        check_model="all", # Автоматически выбирает поддеревья при клике на родительский узел
-        only_leaf_checkmaps=False, 
-        direction="ltr"
-    )
+    # ИСПРАВЛЕННЫЙ ВЫЗОВ: Убраны неподдерживаемые параметры
+    return_select = tree_select(market_tree_nodes)
     
-    selected_group_ids = return_select.get("checked", [])
+    # Безопасное получение списка выбранных элементов
+    selected_group_ids = return_select.get("checked", []) if return_select else []
     
     # Оставляем ручной ввод как альтернативу
     manual_items_str = st.sidebar.text_input(
@@ -115,13 +111,12 @@ if market_tree_nodes:
         help="Отсекает товары, у которых суммарный дневной оборот (кол-во * цену) ниже этого значения"
     )
     
-    # Превращаем выбранные ID групп в множество для мгновенного поиска O(1)
+    # Превращаем выбранные ID групп в множество для мгновенного поиска
     selected_group_set = set(int(x) for x in selected_group_ids)
     
-    # Маппинг: ищем какие товары входят в выбранные галочками папки (или их подпапки)
+    # Маппинг: ищем какие товары входят в выбранные галочками папки
     if selected_group_set:
         for _, row in global_market_df.iterrows():
-            # Если ID текущей группы товара или любой из его родительских групп есть в выбранном сете
             if any(g_id in selected_group_set for g_id in row['all_groups']):
                 items_to_scan[row['typeName']] = row['typeID']
                 
@@ -132,11 +127,11 @@ if market_tree_nodes:
         for _, row in found_manual.iterrows():
             items_to_scan[row['typeName']] = row['typeID']
 
-    # --- ДИНАМИЧЕСКИЙ СЧЕТЧИК ОЧЕРЕДИ (РАБОТАЕТ ДО НАЖАТИЯ КНОПКИ) ---
+    # --- ДИНАМИЧЕСКИЙ СЧЕТЧИК ОЧЕРЕДИ ---
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📊 Параметры текущей очереди")
     num_items = len(items_to_scan)
-    est_time_min = math.ceil((num_items * 0.18) / 60) # Усредненный расчет времени на один поток запросов к ESI
+    est_time_min = math.ceil((num_items * 0.18) / 60) # Усредненный расчет времени на один поток
     
     col_num, col_time = st.sidebar.columns(2)
     col_num.metric("Товаров к скану", f"{num_items} шт.")
@@ -183,7 +178,7 @@ def scan_market(items_dict):
         if jita_buy > 0 and amarr_sell > 0:
             gross_profit = amarr_sell - jita_buy
             roi = (gross_profit / jita_buy) * 100
-            daily_turnover_isk = daily_vol_avg * amarr_sell # Считаем денежный оборот
+            daily_turnover_isk = daily_vol_avg * amarr_sell
             
             results.append({
                 "Товар": item_name,
@@ -225,7 +220,7 @@ if st.button("🚀 Запустить сканирование рынка"):
                     if not filtered_df.empty:
                         st.success(f"Анализ завершен! Найдено {len(filtered_df)} прибыльных позиций из {len(items_to_scan)} отсканированных.")
                         
-                        # Отображение таблицы с идеальным форматированием разрядов чисел
+                        # Отображение таблицы
                         st.dataframe(
                             filtered_df, 
                             use_container_width=True,
